@@ -1,0 +1,394 @@
+// ================= STRATEGY SELECT =================
+// Pick 0-7 and re-upload. See comments below for what each one does.
+#define STRATEGY 0
+
+// ================= Edge (line) sensors =================
+const int LEFT_EDGE  = A0;
+const int RIGHT_EDGE = A1;
+#define LEFT_EDGE_THRESHOLD   450
+#define RIGHT_EDGE_THRESHOLD  400
+
+// ================= Opponent sensors (Sharp GP2Y0E03, analog) =================
+// Closer object = HIGHER analogRead() value on these sensors.
+const int SENS_LEFT            = A3;
+const int SENS_FRONT_LEFT_OUT  = A4;
+const int SENS_FRONT_L         = A5;
+const int SENS_FRONT_R         = A6;
+const int SENS_FRONT_RIGHT_OUT = A2;
+const int SENS_RIGHT           = A7;
+
+#define OPPONENT_THRESHOLD 380   // TUNE THIS: raise it if it reacts too early, lower if too late
+
+// ================= Zigzag search settings =================
+unsigned long zigzagTimer = 0;
+bool zigzagRight = true;
+#define ZIGZAG_INTERVAL 400   // ms between each left/right switch -- TUNE THIS
+
+// ================= Motor Pins =================
+const int AIN1 = 3;
+const int AIN2 = 4;
+const int PWMA = 5;
+const int BIN1 = 8;
+const int BIN2 = 7;
+const int PWMB = 6;
+const int STBY = 9;
+
+// ================= Search behavior mode =================
+// Controls what ACT_SEARCH does once the robot is done with any one-time
+// startup maneuver. Each strategy below sets this.
+enum SearchMode { SEARCH_ZIGZAG, SEARCH_PERIODIC_ADVANCE, SEARCH_STAY_STILL };
+SearchMode searchMode = SEARCH_ZIGZAG;
+int searchSpeed = 220;                    // base speed used by search/zigzag -- TUNE per strategy
+unsigned long periodicAdvanceInterval = 5000; // ms between idle advances (strategies 0,4,7)
+unsigned long periodicAdvanceDuration = 300;  // ms the robot rolls forward each time
+unsigned long periodicAdvanceTimer = 0;
+bool mirrorTurns = false;                 // flips turn direction for "left side" vs "right side" corner strategies
+
+void motor(int leftSpeed, int rightSpeed)
+{
+  digitalWrite(STBY, HIGH);
+  if (leftSpeed >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    leftSpeed = -leftSpeed;
+  }
+  if (rightSpeed >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    rightSpeed = -rightSpeed;
+  }
+  analogWrite(PWMA, constrain(leftSpeed, 0, 255));
+  analogWrite(PWMB, constrain(rightSpeed, 0, 255));
+}
+
+// Reads a sensor 3 times and averages it -- kills single-sample noise spikes
+// that were causing the motors to flicker/jerk between states.
+int readAvg(int pin)
+{
+  int sum = 0;
+  for (int i = 0; i < 3; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return sum / 3;
+}
+
+bool onLine()
+{
+  int leftEdge  = readAvg(LEFT_EDGE);
+  int rightEdge = readAvg(RIGHT_EDGE);
+  return (leftEdge < LEFT_EDGE_THRESHOLD || rightEdge < RIGHT_EDGE_THRESHOLD);
+}
+
+// ================= Reusable startup-maneuver building blocks =================
+
+// Drives forward until an edge sensor sees the border line, or timeoutMs elapses.
+void driveForwardUntilLine(int speed, unsigned long timeoutMs)
+{
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (onLine()) { motor(0, 0); return; }
+    motor(speed, speed);
+    delay(15);
+  }
+  motor(0, 0);
+}
+
+// Backs off the line a bit so the turn-around below doesn't re-trigger it.
+void backOffLine()
+{
+  motor(-220, -220);
+  delay(200); // TUNE THIS
+  motor(0, 0);
+}
+
+// Pivot ~180 degrees in place. mirrorTurns flips which way it spins.
+void turnAround()
+{
+  int dir = mirrorTurns ? 1 : -1;
+  motor(dir * -200, dir * 200);
+  delay(650); // TUNE THIS: calibrate for a 180-degree turn on your bot
+  motor(0, 0);
+}
+
+// Pivot a full 360 degrees in place (used as a "scan while turning" move).
+void fullTurn()
+{
+  int dir = mirrorTurns ? 1 : -1;
+  motor(dir * -200, dir * 200);
+  delay(1300); // TUNE THIS: calibrate for a full 360-degree turn
+  motor(0, 0);
+}
+
+// Hugs the border, driving along the edge until it reaches roughly the
+// opposite side of the arena, then stops.
+void followEdgeToOppositeSide()
+{
+  unsigned long start = millis();
+  unsigned long crossTime = 3500; // TUNE THIS: time to travel edge-to-edge on your arena
+  while (millis() - start < crossTime) {
+    int leftEdge  = readAvg(LEFT_EDGE);
+    int rightEdge = readAvg(RIGHT_EDGE);
+    if (leftEdge < LEFT_EDGE_THRESHOLD) {
+      motor(150, 240); // steer right, away from left line
+    } else if (rightEdge < RIGHT_EDGE_THRESHOLD) {
+      motor(240, 150); // steer left, away from right line
+    } else {
+      motor(210, 210); // drive along the border -- TUNE bias for your arena geometry
+    }
+    delay(15);
+  }
+  motor(0, 0);
+}
+
+// Can't truly strafe on skid-steer wheels -- this simulates a feint by
+// quickly rocking one way then the other before continuing.
+void sidewaysFeint()
+{
+  int dir = mirrorTurns ? -1 : 1;
+  motor(dir * -200, dir * 200);
+  delay(150); // TUNE THIS
+  motor(dir * 200, dir * -200);
+  delay(150); // TUNE THIS
+  motor(0, 0);
+}
+
+void advanceShortDistance(int speed, unsigned long ms)
+{
+  motor(speed, speed);
+  delay(ms);
+  motor(0, 0);
+}
+
+// ================= Per-strategy one-time startup sequences =================
+// These run once, right after the mandatory 5-second start delay, and
+// finish by leaving searchMode / searchSpeed / mirrorTurns set correctly
+// so the main loop()'s ACT_SEARCH case behaves the way that strategy wants
+// from then on.
+
+void strategy0_setup() // Rear Start: to line, turn around, wait + periodic advance
+{
+  driveForwardUntilLine(220, 4000);
+  backOffLine();
+  turnAround();
+  searchMode = SEARCH_PERIODIC_ADVANCE;
+  searchSpeed = 200;
+  periodicAdvanceInterval = 5000;
+}
+
+void strategy1_setup() // Front Start: fast forward search, attacks immediately on close-range detection
+{
+  searchMode = SEARCH_ZIGZAG;
+  searchSpeed = 255; // fast
+}
+
+void strategy2_setup() // Rear Start: to line, turn around, follow edge to far side, then wait still
+{
+  driveForwardUntilLine(220, 4000);
+  backOffLine();
+  turnAround();
+  followEdgeToOppositeSide();
+  searchMode = SEARCH_STAY_STILL;
+}
+
+void strategy3_setup() // Rear Start, corner vs corner (robot's right side): to line, full turn, slow advance search
+{
+  mirrorTurns = false;
+  driveForwardUntilLine(220, 4000);
+  backOffLine();
+  fullTurn();
+  searchMode = SEARCH_ZIGZAG;
+  searchSpeed = 150; // slow
+}
+
+void strategy4_setup() // Front Start: sideways feint, then wait + periodic advance
+{
+  sidewaysFeint();
+  searchMode = SEARCH_PERIODIC_ADVANCE;
+  searchSpeed = 190;
+  periodicAdvanceInterval = 5000;
+}
+
+void strategy5_setup() // Rear Start, corner vs corner (robot's left side): slow forward search, attacks immediately
+{
+  mirrorTurns = true;
+  searchMode = SEARCH_ZIGZAG;
+  searchSpeed = 150; // slow
+}
+
+void strategy6_setup() // Rear Start: to line, side-feint, turn around, wait still
+{
+  driveForwardUntilLine(220, 4000);
+  backOffLine();
+  sidewaysFeint();
+  turnAround();
+  searchMode = SEARCH_STAY_STILL;
+}
+
+void strategy7_setup() // Front Start: periodic short advances, attacks immediately on detection
+{
+  searchMode = SEARCH_PERIODIC_ADVANCE;
+  searchSpeed = 230;
+  periodicAdvanceInterval = 5000;
+  periodicAdvanceDuration = 250;
+}
+
+void runStartupStrategy()
+{
+  switch (STRATEGY) {
+    case 0: strategy0_setup(); break;
+    case 1: strategy1_setup(); break;
+    case 2: strategy2_setup(); break;
+    case 3: strategy3_setup(); break;
+    case 4: strategy4_setup(); break;
+    case 5: strategy5_setup(); break;
+    case 6: strategy6_setup(); break;
+    case 7: strategy7_setup(); break;
+    default: strategy1_setup(); break;
+  }
+  periodicAdvanceTimer = millis();
+}
+
+void setup()
+{
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  delay(5000);   // standard mini sumo start delay -- required before ANY movement
+
+  runStartupStrategy();
+}
+
+// ================= Action smoothing =================
+// Once the robot commits to an action, it holds that action for at least
+// MIN_ACTION_HOLD_MS before it's allowed to switch to a different one.
+// This is what stops the jerky "flip-flop" motion caused by noisy sensor
+// readings changing the decision every single loop.
+enum Action { ACT_SEARCH, ACT_ATTACK, ACT_ALIGN_LEFT, ACT_ALIGN_RIGHT, ACT_SHARP_LEFT, ACT_SHARP_RIGHT };
+Action lastAction = ACT_SEARCH;
+unsigned long lastActionChangeTime = 0;
+#define MIN_ACTION_HOLD_MS 120   // TUNE THIS: raise it if still jerky, lower for snappier reactions
+
+// ================= Attack steering bias =================
+#define ATTACK_FULL_SPEED   255
+#define ATTACK_STEER_SPEED  180   // TUNE THIS: lower it for a sharper turn-in while charging
+
+// ================= Sharp side-turn settings =================
+#define SHARP_TURN_SPEED 200   // TUNE THIS: higher = faster pivot
+
+void loop()
+{
+  // ---------- STEP 1: Check the border FIRST, always ----------
+  if (onLine())
+  {
+    motor(-255, -255);   // reverse
+    delay(250);
+    motor(-255, 255);    // turn away from the line
+    delay(250);
+    lastAction = ACT_SEARCH;
+    lastActionChangeTime = millis();
+    return;              // skip everything else this loop
+  }
+
+  // ---------- STEP 2: Look for the opponent ----------
+  bool seeLeft      = readAvg(SENS_LEFT)            > OPPONENT_THRESHOLD;
+  bool seeFrontLOut = readAvg(SENS_FRONT_LEFT_OUT)  > OPPONENT_THRESHOLD;
+  bool seeFrontL    = readAvg(SENS_FRONT_L)         > OPPONENT_THRESHOLD;
+  bool seeFrontR    = readAvg(SENS_FRONT_R)         > OPPONENT_THRESHOLD;
+  bool seeFrontROut = readAvg(SENS_FRONT_RIGHT_OUT) > OPPONENT_THRESHOLD;
+  bool seeRight     = readAvg(SENS_RIGHT)           > OPPONENT_THRESHOLD;
+
+  Action desiredAction;
+  if (seeFrontL && seeFrontR)
+    desiredAction = ACT_ATTACK;                              // dead ahead -> push
+  else if (seeFrontLOut || seeFrontL)
+    desiredAction = ACT_ALIGN_LEFT;                          // opponent slightly left of front -> curve toward it
+  else if (seeFrontROut || seeFrontR)
+    desiredAction = ACT_ALIGN_RIGHT;                         // opponent slightly right of front -> curve toward it
+  else if (seeLeft)
+    desiredAction = ACT_SHARP_LEFT;                          // opponent beside on the left -> fast pivot to face it
+  else if (seeRight)
+    desiredAction = ACT_SHARP_RIGHT;                         // opponent beside on the right -> fast pivot to face it
+  else
+    desiredAction = ACT_SEARCH;                              // nothing seen -> search per strategy's mode
+
+  // Only switch actions if we've held the current one long enough
+  if (desiredAction != lastAction && millis() - lastActionChangeTime >= MIN_ACTION_HOLD_MS)
+  {
+    lastAction = desiredAction;
+    lastActionChangeTime = millis();
+  }
+
+  // ---------- STEP 3: Run whichever action is currently committed ----------
+  switch (lastAction)
+  {
+    case ACT_ATTACK:
+      motor(ATTACK_FULL_SPEED, ATTACK_FULL_SPEED);      // dead ahead -> straight full push
+      break;
+
+    case ACT_ALIGN_LEFT:
+      motor(ATTACK_STEER_SPEED, ATTACK_FULL_SPEED);     // still charging forward, curving left toward opponent
+      break;
+
+    case ACT_ALIGN_RIGHT:
+      motor(ATTACK_FULL_SPEED, ATTACK_STEER_SPEED);     // still charging forward, curving right toward opponent
+      break;
+
+    case ACT_SHARP_LEFT:
+      motor(-SHARP_TURN_SPEED, SHARP_TURN_SPEED);       // fast in-place pivot to face opponent on the left
+      break;
+
+    case ACT_SHARP_RIGHT:
+      motor(SHARP_TURN_SPEED, -SHARP_TURN_SPEED);       // fast in-place pivot to face opponent on the right
+      break;
+
+    case ACT_SEARCH:
+    default:
+      switch (searchMode)
+      {
+        case SEARCH_ZIGZAG:
+          if (millis() - zigzagTimer > ZIGZAG_INTERVAL)
+          {
+            zigzagRight = !zigzagRight;
+            zigzagTimer = millis();
+          }
+          if (zigzagRight)
+            motor(searchSpeed, searchSpeed * 0.6);   // curve right, still moving forward
+          else
+            motor(searchSpeed * 0.6, searchSpeed);   // curve left, still moving forward
+          break;
+
+        case SEARCH_PERIODIC_ADVANCE:
+          if (millis() - periodicAdvanceTimer >= periodicAdvanceInterval)
+          {
+            motor(searchSpeed, searchSpeed);
+            delay(periodicAdvanceDuration);
+            motor(0, 0);
+            periodicAdvanceTimer = millis();
+          } else {
+            motor(0, 0);
+          }
+          break;
+
+        case SEARCH_STAY_STILL:
+        default:
+          motor(0, 0);
+          break;
+      }
+      break;
+  }
+
+  delay(15);   // small pacing delay -- keeps motor commands from changing too fast
+}
