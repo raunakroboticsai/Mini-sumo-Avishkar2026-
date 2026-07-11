@@ -1,0 +1,354 @@
+
+
+// ================= Edge (line) sensors =================
+const int LEFT_EDGE  = A0;
+const int RIGHT_EDGE = A1;
+#define LEFT_EDGE_THRESHOLD   450
+#define RIGHT_EDGE_THRESHOLD  400
+
+// ================= Opponent sensors (Sharp GP2Y0E03, analog) =================
+// Closer object = HIGHER analogRead() value on these sensors.
+const int SENS_LEFT            = A3;
+const int SENS_FRONT_LEFT_OUT  = A4;
+const int SENS_FRONT_L         = A5;
+const int SENS_FRONT_R         = A6;
+const int SENS_FRONT_RIGHT_OUT = A2;
+const int SENS_RIGHT           = A7;
+
+#define OPPONENT_THRESHOLD 380   // TUNE THIS: raise it if it reacts too early, lower if too late
+
+// ================= Corner-vs-corner orientation =================
+// Your robot starts in a corner, diagonally facing the opponent's corner.
+// If your robot's corner is on the arena's RIGHT side, leave this false.
+// If it's on the LEFT side, set it to true — this flips which way the
+// robot pivots during search/turns so it sweeps toward the opponent's
+// corner instead of away from it.
+#define MIRROR_TURNS false
+
+// ================= Search settings (border-hit triggered spin scan) =================
+// Instead of scanning on a timer, the robot drives forward hunting for
+// the opponent. When it hits the border, it backs off, drives back
+// toward the arena center, then does a step-wise spin scan there --
+// sensors stay active through every step, so it stops turant
+// (immediately) the moment it spots the opponent. If the spin finishes
+// with nothing found, it goes back to driving border-to-border.
+#define SEARCH_DRIVE_SPEED    230  // forward hunting speed between border hits -- TUNE THIS
+#define RETURN_TO_CENTER_MS   1200 // ms driven back toward center after a border hit -- TUNE THIS on your arena
+#define SPIN_STEP_COUNT       12   // number of steps to complete one 360 -- TUNE THIS
+#define SPIN_STEP_MS          110  // ms per step (12 steps * 110ms ~= full 360, calibrate like a full turn) -- TUNE THIS
+#define SPIN_STEP_PAUSE_MS    50   // short pause after each step to let sensors settle before checking
+
+// ================= Motor Pins =================
+const int AIN1 = 3;
+const int AIN2 = 4;
+const int PWMA = 5;
+const int BIN1 = 8;
+const int BIN2 = 7;
+const int PWMB = 6;
+const int STBY = 9;
+
+void motor(int leftSpeed, int rightSpeed)
+{
+  digitalWrite(STBY, HIGH);
+  if (leftSpeed >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    leftSpeed = -leftSpeed;
+  }
+  if (rightSpeed >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    rightSpeed = -rightSpeed;
+  }
+  analogWrite(PWMA, constrain(leftSpeed, 0, 255));
+  analogWrite(PWMB, constrain(rightSpeed, 0, 255));
+}
+
+// Reads a sensor 3 times and averages it -- kills single-sample noise spikes
+// that were causing the motors to flicker/jerk between states.
+int readAvg(int pin)
+{
+  int sum = 0;
+  for (int i = 0; i < 3; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return sum / 3;
+}
+
+bool onLine()
+{
+  int leftEdge  = readAvg(LEFT_EDGE);
+  int rightEdge = readAvg(RIGHT_EDGE);
+  return (leftEdge < LEFT_EDGE_THRESHOLD || rightEdge < RIGHT_EDGE_THRESHOLD);
+}
+
+// ================= Action smoothing =================
+// Once the robot commits to an action, it holds that action for at least
+// MIN_ACTION_HOLD_MS before it's allowed to switch to a different one.
+// This is what stops the jerky "flip-flop" motion caused by noisy sensor
+// readings changing the decision every single loop.
+enum Action { ACT_SEARCH, ACT_ATTACK, ACT_ALIGN_LEFT, ACT_ALIGN_RIGHT, ACT_SHARP_LEFT, ACT_SHARP_RIGHT };
+Action lastAction = ACT_SEARCH;
+unsigned long lastActionChangeTime = 0;
+#define MIN_ACTION_HOLD_MS 120   // TUNE THIS: raise it if still jerky, lower for snappier reactions
+
+// ================= Startup maneuver: line + 360 spin scan =================
+
+// Drives forward until an edge sensor sees the border line, or timeoutMs elapses.
+void driveForwardUntilLine(int speed, unsigned long timeoutMs)
+{
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (onLine()) { motor(0, 0); return; }
+    motor(speed, speed);
+    delay(15);
+  }
+  motor(0, 0);
+}
+
+// Backs off the line a bit so the spin below doesn't re-trigger it.
+void backOffLine()
+{
+  motor(-220, -220);
+  delay(200); // TUNE THIS
+  motor(0, 0);
+}
+
+// Pivot a full 360 degrees in place -- scans all around for the opponent
+// before committing to the search pattern.
+void fullTurn()
+{
+  int dir = MIRROR_TURNS ? 1 : -1;
+  motor(dir * -200, dir * 200);
+  delay(1300); // TUNE THIS: calibrate for a full 360-degree turn on your bot
+  motor(0, 0);
+}
+
+// Returns true if any opponent sensor is currently triggered.
+bool opponentVisible()
+{
+  return readAvg(SENS_LEFT)            > OPPONENT_THRESHOLD ||
+         readAvg(SENS_FRONT_LEFT_OUT)  > OPPONENT_THRESHOLD ||
+         readAvg(SENS_FRONT_L)         > OPPONENT_THRESHOLD ||
+         readAvg(SENS_FRONT_R)         > OPPONENT_THRESHOLD ||
+         readAvg(SENS_FRONT_RIGHT_OUT) > OPPONENT_THRESHOLD ||
+         readAvg(SENS_RIGHT)           > OPPONENT_THRESHOLD;
+}
+
+// Periodic spin scan: turns in small steps instead of one blind full
+// spin. After EVERY step it checks BOTH the border and the opponent
+// sensors -- border safety comes first (the robot must never cross the
+// line, so if it appears mid-spin the robot backs off immediately and
+// the scan ends). If the border is clear and the opponent shows up, the
+// spin stops turant and returns true so loop() can attack right away.
+bool spinScan()
+{
+  int dir = MIRROR_TURNS ? 1 : -1;
+  for (int i = 0; i < SPIN_STEP_COUNT; i++) {
+    motor(dir * -200, dir * 200);
+    delay(SPIN_STEP_MS);
+    motor(0, 0);
+    delay(SPIN_STEP_PAUSE_MS);
+
+    if (onLine()) {
+      // Border safety overrides everything else -- back off immediately.
+      motor(-200, -200);
+      delay(150);
+      motor(0, 0);
+      return false;
+    }
+    if (opponentVisible()) return true;   // stop turant, opponent found
+  }
+  return false;
+}
+
+// Runs the full border-hit sequence: reverse off the line, turn away,
+// drive back toward the arena center, then do a step-wise spin scan
+// right there. The border sensors stay active through EVERY step of
+// EVERY phase below -- the robot must never cross outside the arena, no
+// matter what. If the line shows up again while heading to center, it
+// stops immediately and scans from wherever it is instead of continuing
+// blind. If nothing is found, the robot resumes normal forward search.
+void handleBorderHit()
+{
+  // Step 1: reverse straight back, away from the line.
+  motor(-255, -255);
+  delay(300); // TUNE THIS: enough to fully clear the line
+
+  // Step 2: turn to face into the arena, away from the border.
+  int dir = MIRROR_TURNS ? -1 : 1;
+  motor(dir * -220, dir * 220);
+  delay(450); // TUNE THIS: increase if the robot ends up facing along the
+              // border instead of into the arena -- test and calibrate
+  motor(0, 0);
+
+  // Step 3: drive toward center -- border-guarded the whole way. If the
+  // line reappears (bad angle, small arena, corner effects) we stop
+  // turant and back off instead of driving further. Opponent sensors are
+  // checked too, so a same-second opponent sighting isn't missed.
+  unsigned long start = millis();
+  while (millis() - start < RETURN_TO_CENTER_MS) {
+    if (onLine()) {
+      motor(-200, -200);
+      delay(150);
+      motor(0, 0);
+      break;   // stop heading to center, scan from right here instead
+    }
+    if (opponentVisible()) { motor(0, 0); break; }   // opponent showed up, let loop() attack turant
+    motor(SEARCH_DRIVE_SPEED, SEARCH_DRIVE_SPEED);
+    delay(15);
+  }
+  motor(0, 0);
+
+  // Step 4: spin scan right here (border + opponent both checked every step).
+  spinScan();
+
+  lastAction = ACT_SEARCH;
+  lastActionChangeTime = millis();
+}
+
+void setup()
+{
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  delay(5000);   // standard mini sumo start delay -- required before ANY movement
+
+  // Corner-vs-corner startup: go to the line, back off, then do one full
+  // 360-degree spin to scan the arena for the opponent before switching
+  // into forward search (border-hit will trigger the spin-scan sequence).
+  driveForwardUntilLine(220, 4000);
+  backOffLine();
+  fullTurn();
+}
+
+// ================= Attack steering bias =================
+#define ATTACK_FULL_SPEED   255
+#define ATTACK_STEER_SPEED  180   // TUNE THIS: lower it for a sharper turn-in while charging
+
+// ================= Sharp side-turn settings =================
+#define SHARP_TURN_SPEED 200   // TUNE THIS: higher = faster pivot
+
+void loop()
+{
+  // ---------- STEP 1: Check the border FIRST, always ----------
+  if (onLine())
+  {
+    handleBorderHit();   // reverse, return toward center, spin-scan there
+    return;               // skip everything else this loop
+  }
+
+  // ---------- STEP 2: Look for the opponent ----------
+  bool seeLeft      = readAvg(SENS_LEFT)            > OPPONENT_THRESHOLD;
+  bool seeFrontLOut = readAvg(SENS_FRONT_LEFT_OUT)  > OPPONENT_THRESHOLD;
+  bool seeFrontL    = readAvg(SENS_FRONT_L)         > OPPONENT_THRESHOLD;
+  bool seeFrontR    = readAvg(SENS_FRONT_R)         > OPPONENT_THRESHOLD;
+  bool seeFrontROut = readAvg(SENS_FRONT_RIGHT_OUT) > OPPONENT_THRESHOLD;
+  bool seeRight     = readAvg(SENS_RIGHT)           > OPPONENT_THRESHOLD;
+
+  Action desiredAction;
+  if (seeFrontL && seeFrontR)
+    desiredAction = ACT_ATTACK;                              // dead ahead -> push
+  else if (seeFrontLOut || seeFrontL)
+    desiredAction = ACT_ALIGN_LEFT;                          // opponent slightly left of front -> curve toward it
+  else if (seeFrontROut || seeFrontR)
+    desiredAction = ACT_ALIGN_RIGHT;                         // opponent slightly right of front -> curve toward it
+  else if (seeLeft)
+    desiredAction = ACT_SHARP_LEFT;                          // opponent beside on the left -> fast pivot to face it
+  else if (seeRight)
+    desiredAction = ACT_SHARP_RIGHT;                         // opponent beside on the right -> fast pivot to face it
+  else
+    desiredAction = ACT_SEARCH;                              // nothing seen -> keep searching
+
+  // Only switch actions if we've held the current one long enough
+  if (desiredAction != lastAction && millis() - lastActionChangeTime >= MIN_ACTION_HOLD_MS)
+  {
+    lastAction = desiredAction;
+    lastActionChangeTime = millis();
+  }
+
+  // ---------- STEP 3: Run whichever action is currently committed ----------
+  switch (lastAction)
+  {
+    case ACT_ATTACK:
+      motor(ATTACK_FULL_SPEED, ATTACK_FULL_SPEED);      // dead ahead -> straight full push
+      break;
+
+    case ACT_ALIGN_LEFT:
+      motor(ATTACK_STEER_SPEED, ATTACK_FULL_SPEED);     // still charging forward, curving left toward opponent
+      break;
+
+    case ACT_ALIGN_RIGHT:
+      motor(ATTACK_FULL_SPEED, ATTACK_STEER_SPEED);     // still charging forward, curving right toward opponent
+      break;
+
+    case ACT_SHARP_LEFT:
+      motor(-SHARP_TURN_SPEED, SHARP_TURN_SPEED);       // fast in-place pivot to face opponent on the left
+      break;
+
+    case ACT_SHARP_RIGHT:
+      motor(SHARP_TURN_SPEED, -SHARP_TURN_SPEED);       // fast in-place pivot to face opponent on the right
+      break;
+
+    case ACT_SEARCH:
+    default:
+      // Forward hunting: drive straight ahead looking for the opponent.
+      // Sensors are checked every loop (STEP 2 above), so the moment the
+      // opponent appears this switches to attack turant. If nothing is
+      // found, the robot eventually reaches a border, which triggers
+      // handleBorderHit()'s return-to-center + spin-scan sequence.
+      motor(SEARCH_DRIVE_SPEED, SEARCH_DRIVE_SPEED);
+      break;
+  }
+
+  delay(15);   // small pacing delay -- keeps motor commands from changing too fast
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
